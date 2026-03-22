@@ -19,6 +19,8 @@ import {
 //   - get_current_time → know what time it is
 //   - get_status       → check its own health
 //   - signal_done      → tell us it's finished
+//   - get_weather      → check weather for any city
+//   - get_news         → get latest news headlines
 
 let mcpServer: McpSdkServerConfigWithInstance | null = null;
 
