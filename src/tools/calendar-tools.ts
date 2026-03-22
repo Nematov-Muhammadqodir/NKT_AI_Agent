@@ -1,30 +1,14 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { MongoClient, ObjectId } from "mongodb";
+import { ObjectId } from "mongodb";
+import { db, ensureMongo } from "../db.js";
 
 // ============================================================
 // CALENDAR / ARRANGEMENT TOOLS
 // ============================================================
-// Uses MongoDB to store and manage arrangements (events).
-// Claude can create, list, and delete arrangements for users.
-//
-// Each arrangement has:
-//   - title, description, date/time
-//   - userId (Telegram chat ID so each user has their own)
+// Uses shared MongoDB connection to store arrangements.
 
-const client = new MongoClient(process.env.MONGODB_URI!);
-const db = client.db("NatsukiAgent");
 const arrangements = db.collection("arrangements");
-
-// Connect once at startup
-let connected = false;
-async function ensureConnected() {
-  if (!connected) {
-    await client.connect();
-    connected = true;
-    console.log("[MongoDB] Connected");
-  }
-}
 
 export function calendarTools() {
   return [
@@ -49,7 +33,7 @@ export function calendarTools() {
       },
       async (args) => {
         try {
-          await ensureConnected();
+          await ensureMongo();
 
           const doc = {
             chatId: args.chat_id,
@@ -107,7 +91,7 @@ export function calendarTools() {
       },
       async (args) => {
         try {
-          await ensureConnected();
+          await ensureMongo();
 
           const now = new Date();
           let query: Record<string, unknown> = { chatId: args.chat_id };
@@ -174,7 +158,7 @@ export function calendarTools() {
       },
       async (args) => {
         try {
-          await ensureConnected();
+          await ensureMongo();
 
           const result = await arrangements.deleteOne({
             _id: new ObjectId(args.id),
