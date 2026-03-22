@@ -6,6 +6,7 @@ import { signalTools } from "./signal-tools.js";
 import { weatherTools } from "./weather-tools.js";
 import { newsTools } from "./news-tools.js";
 import { emailTools } from "./email-tools.js";
+import { calendarTools } from "./calendar-tools.js";
 
 // ============================================================
 // MCP SERVER
@@ -37,6 +38,7 @@ export function buildMcpServer(bot: Bot) {
     ...weatherTools(),
     ...newsTools(),
     ...emailTools(),
+    ...calendarTools(),
   ];
 
   console.log(

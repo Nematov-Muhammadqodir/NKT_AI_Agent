@@ -2,6 +2,11 @@ import {
   query,
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
+import {
+  getHistory,
+  saveMessage,
+  formatHistory,
+} from "./chat-history.js";
 
 // ============================================================
 // THE CLAUDE MODULE — now with TOOLS!
@@ -22,6 +27,10 @@ import {
 //   - get_weather      → check weather for any city
 //   - get_news         → get latest news headlines
 //   - send_email       → send emails from kevinbek0301@gmail.com
+//   - get_emails       → read inbox, unread, or spam emails
+//   - create_arrangement → schedule events/reminders in MongoDB
+//   - list_arrangements  → view upcoming/past arrangements
+//   - delete_arrangement → remove an arrangement
 
 let mcpServer: McpSdkServerConfigWithInstance | null = null;
 
@@ -39,9 +48,11 @@ IMPORTANT RULES:
 - You will receive messages in this format: [chatId:123] userName: message
 - Always use send_message with the correct chat_id to respond.
 - After you finish responding, call signal_done.
+- You have CONVERSATION HISTORY. Messages prefixed with "--- CONVERSATION HISTORY ---" are previous messages in this chat. Use them to remember what the user said before and maintain context.
 - You CAN send emails using the send_email tool. When a user asks you to send an email, use it. The email will be sent from kevinbek0301@gmail.com.
-- You have access to ALL tools listed: send_message, react_to_message, get_current_time, get_status, signal_done, get_weather, get_news, send_email, get_emails. Use them when appropriate.
+- You have access to ALL tools listed: send_message, react_to_message, get_current_time, get_status, signal_done, get_weather, get_news, send_email, get_emails, create_arrangement, list_arrangements, delete_arrangement. Use them when appropriate.
 - You can read emails with get_emails: fetch latest, unread only, or spam folder. Use it when a user asks about their emails.
+- You can manage arrangements/events/reminders: create_arrangement to schedule, list_arrangements to view, delete_arrangement to remove. Always use get_current_time first to know the current date when scheduling.
 
 PERSONALITY:
 - Be conversational, warm, and fun — like texting a funny friend 😄
@@ -58,8 +69,15 @@ export async function chat(
   userName: string,
   userMessage: string
 ): Promise<void> {
-  // Format the message so Claude knows WHO said it and WHERE
-  const prompt = `[chatId:${chatId}] ${userName}: ${userMessage}`;
+  // Load conversation history for this chat
+  const previousMessages = await getHistory(chatId);
+  const historyContext = formatHistory(previousMessages);
+
+  // Save the user's message to history
+  await saveMessage(chatId, "user", userName, userMessage);
+
+  // Format the message with history so Claude remembers the conversation
+  const prompt = `${historyContext}[chatId:${chatId}] ${userName}: ${userMessage}`;
 
   const q = query({
     prompt,
@@ -86,6 +104,9 @@ export async function chat(
   // When Claude calls send_message, the SDK runs our handler,
   // sends the result back to Claude, and Claude continues.
 
+  // Track what Claude sends via send_message so we can save it to history
+  const sentMessages: string[] = [];
+
   for await (const message of q) {
     if (message.type === "assistant") {
       const content = message.message?.content;
@@ -95,8 +116,13 @@ export async function chat(
         if (typeof block !== "object" || !block) continue;
 
         if ("type" in block && block.type === "tool_use") {
-          const toolBlock = block as { name: string; input: unknown };
+          const toolBlock = block as { name: string; input: Record<string, unknown> };
           console.log(`[Tool Call] ${toolBlock.name}`);
+
+          // Capture the text Claude sends via send_message
+          if (toolBlock.name === "send_message" && toolBlock.input?.text) {
+            sentMessages.push(toolBlock.input.text as string);
+          }
         }
 
         if ("type" in block && block.type === "text") {
@@ -114,5 +140,10 @@ export async function chat(
         `[Turn Complete] turns: ${result.num_turns}, cost: $${result.total_cost_usd}`
       );
     }
+  }
+
+  // Save Claude's response to history
+  if (sentMessages.length > 0) {
+    await saveMessage(chatId, "assistant", "Agent", sentMessages.join("\n"));
   }
 }
