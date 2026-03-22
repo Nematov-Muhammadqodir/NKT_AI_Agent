@@ -2,21 +2,20 @@ import {
   query,
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
-import {
-  getHistory,
-  saveMessage,
-  formatHistory,
-} from "./chat-history.js";
+import { randomUUID } from "crypto";
 
 // ============================================================
-// THE CLAUDE MODULE — now with TOOLS!
+// THE CLAUDE MODULE — now with SESSION PERSISTENCE!
 // ============================================================
-// Before: Claude could only return text → we sent it to Telegram
-// Now:    Claude has tools → it sends messages to Telegram ITSELF
+// Each Telegram chatId maps to a persistent session ID.
+// When a user sends a new message, we RESUME the existing
+// session instead of starting fresh. Claude sees the full
+// conversation history automatically — no manual history needed.
 //
-// This is the key shift from CHATBOT to AGENT:
-//   Chatbot: user asks → AI responds → our code acts
-//   Agent:   user asks → AI decides what to do → AI acts directly
+// Flow:
+//   1. User sends message → check if chatId has a session
+//   2. If yes → resume that session (Claude sees all past messages)
+//   3. If no  → create new session, store the session ID
 //
 // Claude now has access to:
 //   - send_message     → talk to users
@@ -38,6 +37,44 @@ export function setMcpServer(server: McpSdkServerConfigWithInstance) {
   mcpServer = server;
 }
 
+// ============================================================
+// SESSION MANAGEMENT
+// ============================================================
+// Maps chatId → sessionId so each Telegram chat has its own
+// persistent Claude session. Sessions survive across messages
+// but not across bot restarts (stored in memory).
+// For persistence across restarts, we store in MongoDB too.
+
+import { MongoClient } from "mongodb";
+
+const mongoClient = new MongoClient(process.env.MONGODB_URI!);
+const db = mongoClient.db("NatsukiAgent");
+const sessions = db.collection("sessions");
+
+let mongoConnected = false;
+async function ensureMongo() {
+  if (!mongoConnected) {
+    await mongoClient.connect();
+    mongoConnected = true;
+  }
+}
+
+// Get or create a session ID for a chatId
+async function getSessionId(chatId: number): Promise<{ sessionId: string; isNew: boolean }> {
+  await ensureMongo();
+
+  const doc = await sessions.findOne({ chatId });
+  if (doc) {
+    return { sessionId: doc.sessionId, isNew: false };
+  }
+
+  // Create a new session ID
+  const sessionId = randomUUID();
+  await sessions.insertOne({ chatId, sessionId, createdAt: new Date() });
+  console.log(`[Session] New session ${sessionId} for chat ${chatId}`);
+  return { sessionId, isNew: true };
+}
+
 // The system prompt now tells Claude to USE TOOLS instead of
 // returning plain text. This is critical — without this
 // instruction, Claude might just output text that nobody sees.
@@ -48,7 +85,6 @@ IMPORTANT RULES:
 - You will receive messages in this format: [chatId:123] userName: message
 - Always use send_message with the correct chat_id to respond.
 - After you finish responding, call signal_done.
-- You have CONVERSATION HISTORY. Messages prefixed with "--- CONVERSATION HISTORY ---" are previous messages in this chat. Use them to remember what the user said before and maintain context.
 - You CAN send emails using the send_email tool. When a user asks you to send an email, use it. The email will be sent from kevinbek0301@gmail.com.
 - You have access to ALL tools listed: send_message, react_to_message, get_current_time, get_status, signal_done, get_weather, get_news, send_email, get_emails, create_arrangement, list_arrangements, delete_arrangement. Use them when appropriate.
 - You can read emails with get_emails: fetch latest, unread only, or spam folder. Use it when a user asks about their emails.
@@ -69,21 +105,18 @@ export async function chat(
   userName: string,
   userMessage: string
 ): Promise<void> {
-  // Load conversation history for this chat
-  const previousMessages = await getHistory(chatId);
-  const historyContext = formatHistory(previousMessages);
+  // Get or create a persistent session for this chat
+  const { sessionId, isNew } = await getSessionId(chatId);
 
-  // Save the user's message to history
-  await saveMessage(chatId, "user", userName, userMessage);
-
-  // Format the message with history so Claude remembers the conversation
-  const prompt = `${historyContext}[chatId:${chatId}] ${userName}: ${userMessage}`;
+  const prompt = `[chatId:${chatId}] ${userName}: ${userMessage}`;
 
   const q = query({
     prompt,
     options: {
       systemPrompt: SYSTEM_PROMPT,
       maxTurns: 10,
+      // Resume existing session so Claude remembers the conversation
+      ...(isNew ? { sessionId } : { resume: sessionId }),
       // Pass our MCP server so Claude can use our tools
       mcpServers: mcpServer ? { "olimjonov-agent": mcpServer } : undefined,
       // Allow Claude to call tools without asking permission
@@ -95,17 +128,9 @@ export async function chat(
   // ============================================================
   // PROCESS THE STREAM
   // ============================================================
-  // Now the loop is more interesting. Claude might:
-  //   1. Call send_message → we see a tool_use block
-  //   2. Call signal_done  → we know it's finished
-  //   3. Output text       → (shouldn't happen, but we handle it)
-  //
-  // The SDK handles tool execution automatically!
-  // When Claude calls send_message, the SDK runs our handler,
-  // sends the result back to Claude, and Claude continues.
-
-  // Track what Claude sends via send_message so we can save it to history
-  const sentMessages: string[] = [];
+  // The SDK now handles session persistence automatically.
+  // When we resume a session, Claude sees ALL previous messages
+  // in that session — no manual history needed!
 
   for await (const message of q) {
     if (message.type === "assistant") {
@@ -118,11 +143,6 @@ export async function chat(
         if ("type" in block && block.type === "tool_use") {
           const toolBlock = block as { name: string; input: Record<string, unknown> };
           console.log(`[Tool Call] ${toolBlock.name}`);
-
-          // Capture the text Claude sends via send_message
-          if (toolBlock.name === "send_message" && toolBlock.input?.text) {
-            sentMessages.push(toolBlock.input.text as string);
-          }
         }
 
         if ("type" in block && block.type === "text") {
@@ -140,10 +160,5 @@ export async function chat(
         `[Turn Complete] turns: ${result.num_turns}, cost: $${result.total_cost_usd}`
       );
     }
-  }
-
-  // Save Claude's response to history
-  if (sentMessages.length > 0) {
-    await saveMessage(chatId, "assistant", "Agent", sentMessages.join("\n"));
   }
 }
