@@ -1,58 +1,61 @@
 import "dotenv/config";
 import { Bot } from "grammy";
+import { chat, setMcpServer } from "./claude.js";
+import { buildMcpServer } from "./tools/server.js";
 
-// ============================================================
-// STEP 1: Create the bot instance
-// ============================================================
-// The Bot class from grammY connects to Telegram's API.
-// It needs your bot token (from @BotFather) to authenticate.
-// Think of it as: "I am bot X, let me receive messages"
 const token = process.env.BOT_TOKEN;
-if (!token) {
-  throw new Error("BOT_TOKEN is missing in .env file");
-}
+if (!token) throw new Error("BOT_TOKEN is missing in .env file");
 
 const bot = new Bot(token);
 
 // ============================================================
-// STEP 2: Handle incoming messages
+// STEP 1: Build the MCP server and connect it to Claude
 // ============================================================
-// bot.on("message:text") listens for text messages.
-// `ctx` (context) contains everything about the message:
-//   - ctx.message.text  → what the user sent
-//   - ctx.from          → who sent it
-//   - ctx.chat          → which chat it came from
-//   - ctx.reply()       → send a message back
+// This is the wiring step. We:
+//   1. Create tools (passing bot so they can send messages)
+//   2. Bundle them into an MCP server
+//   3. Tell Claude about the server
+//
+// After this, Claude can call send_message, get_time, etc.
+const mcpServer = buildMcpServer(bot);
+setMcpServer(mcpServer);
+
+bot.command("start", (ctx) =>
+  ctx.reply("Hi! I'm an AI agent. Send me any message!")
+);
+
+// ============================================================
+// STEP 2: Handle messages — but now Claude is in control
+// ============================================================
+// Before (Stage 2): we called chat() and sent the response
+// Now (Stage 3):    we call chat() and Claude sends it ITSELF
+//                   using the send_message tool
+//
+// Notice: we no longer do ctx.reply() with Claude's response.
+// Claude calls send_message directly via the MCP server.
 bot.on("message:text", async (ctx) => {
   const userMessage = ctx.message.text;
   const userName = ctx.from?.first_name ?? "Unknown";
-
   console.log(`[${userName}]: ${userMessage}`);
 
-  // For now, just echo it back
-  await ctx.reply(`You said: ${userMessage}`);
+  await ctx.replyWithChatAction("typing");
+
+  try {
+    // chat() no longer returns a string — Claude handles
+    // the response itself by calling the send_message tool
+    await chat(ctx.chat.id, userName, userMessage);
+  } catch (error) {
+    console.error("Claude error:", error);
+    await ctx.reply("Sorry, something went wrong. Try again.");
+  }
 });
 
-// ============================================================
-// STEP 3: Start the bot
-// ============================================================
-// bot.start() opens a long-polling connection to Telegram.
-// Long polling = your bot asks Telegram "any new messages?"
-// repeatedly. Telegram holds the connection open until there
-// IS a message, then sends it. This is simpler than webhooks.
 console.log("Bot is starting...");
 bot.start({
-  // drop_pending_updates: don't process messages that arrived
-  // while the bot was offline (avoids replaying old messages)
   drop_pending_updates: true,
-  onStart: () => console.log("Bot is running!"),
+  onStart: () => console.log("Bot is running with tools!"),
 });
 
-// ============================================================
-// STEP 4: Graceful shutdown
-// ============================================================
-// When you press Ctrl+C, Node sends SIGINT. We catch it and
-// stop the bot cleanly (closes the polling connection).
 process.on("SIGINT", () => {
   console.log("Shutting down...");
   bot.stop();
